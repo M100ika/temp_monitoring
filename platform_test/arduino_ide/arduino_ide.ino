@@ -1,0 +1,89 @@
+/*
+ * Hello World для ESP32-C6-LCD-1.47
+ * Arduino IDE 2.x + ESP32 Arduino Core 3.x
+ * Библиотека: LovyanGFX (установить через Tools > Manage Libraries)
+ *
+ * Настройки Arduino IDE:
+ *   Board:   ESP32C6 Dev Module  (Board Manager: esp32 by Espressif >= 3.0)
+ *   Port:    /dev/ttyACM0
+ *   Speed:   460800
+ */
+
+#include <LovyanGFX.hpp>
+
+class LGFX : public lgfx::LGFX_Device {
+  lgfx::Panel_ST7789 _panel_instance;
+  lgfx::Bus_SPI      _bus_instance;
+  lgfx::Light_PWM    _light_instance;
+
+public:
+  LGFX() {
+    { auto cfg = _bus_instance.config();
+      cfg.spi_host   = SPI2_HOST;
+      cfg.spi_mode   = 0;
+      cfg.freq_write = 80000000;
+      cfg.pin_sclk   = 6;
+      cfg.pin_mosi   = 7;
+      cfg.pin_miso   = -1;
+      cfg.pin_dc     = 15;
+      _bus_instance.config(cfg);
+      _panel_instance.setBus(&_bus_instance);
+    }
+    { auto cfg = _panel_instance.config();
+      cfg.pin_cs   = 14;
+      cfg.pin_rst  = 1;
+      cfg.panel_width  = 172;
+      cfg.panel_height = 320;
+      cfg.offset_x = 34;
+      cfg.invert   = true;
+      _panel_instance.config(cfg);
+    }
+    { auto cfg = _light_instance.config();
+      cfg.pin_bl = 22;
+      _light_instance.config(cfg);
+      _panel_instance.setLight(&_light_instance);
+    }
+    setPanel(&_panel_instance);
+  }
+};
+
+static LGFX lcd;
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("ESP32-C6 LCD Test - Arduino IDE");
+
+  lcd.init();
+  lcd.setRotation(0);
+  lcd.fillScreen(TFT_BLACK);
+
+  lcd.setTextColor(TFT_MAGENTA, TFT_BLACK);
+  lcd.setTextSize(2);
+  lcd.setCursor(10, 10);
+  lcd.println("Hello World!");
+
+  lcd.setTextColor(TFT_WHITE, TFT_BLACK);
+  lcd.setTextSize(1);
+  lcd.setCursor(10, 50);
+  lcd.println("Arduino IDE 2.x");
+  lcd.setCursor(10, 65);
+  lcd.println("ESP32-C6-LCD-1.47");
+  lcd.setCursor(10, 80);
+  lcd.println("LovyanGFX OK");
+
+  lcd.fillRect(10,  110, 40, 40, TFT_RED);
+  lcd.fillRect(60,  110, 40, 40, TFT_GREEN);
+  lcd.fillRect(110, 110, 40, 40, TFT_BLUE);
+}
+
+void loop() {
+  static uint32_t t = millis();
+  if (millis() - t > 1000) {
+    t = millis();
+    static int cnt = 0;
+    lcd.setCursor(10, 200);
+    lcd.setTextColor(TFT_YELLOW, TFT_BLACK);
+    lcd.printf("Uptime: %d s   ", ++cnt);
+    Serial.printf("Tick: %d\n", cnt);
+  }
+}

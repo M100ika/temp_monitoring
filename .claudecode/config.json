@@ -1,0 +1,20 @@
+{
+    "name": "NU-Temperature-Project-ESP-IDF",
+    "image": "mcr.microsoft.com/devcontainers/python:3.12",
+    "runArgs": [
+        "--device=/dev/ttyACM0:/dev/ttyACM0",
+        "--privileged"
+    ],
+
+    "postCreateCommand": "apt-get update && apt-get install -y git curl && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && apt-get install -y nodejs && pip install platformio && npm install -g @anthropic-ai/claude-code",
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                "platformio.platformio-ide",
+                "ms-vscode.cpptools-extension-pack",
+                "espressif.esp-idf-extension"
+            ]
+        }
+    },
+    "remoteUser": "root"
+}

@@ -1,0 +1,22 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pio --version)",
+      "Bash(~/.local/bin/pio --version)",
+      "Read(//home/maxat/.platformio/packages/**)",
+      "Read(//home/maxat/.platformio/platforms/**)",
+      "Bash(export PATH=\"$HOME/.local/bin:$PATH\")",
+      "Bash(pio boards:*)",
+      "Bash(/home/maxat/.platformio/penv/bin/pip install:*)",
+      "Bash(export PATH=\"$HOME/.platformio/penv/bin:$PATH\")",
+      "Bash(pio run:*)",
+      "Bash(echo \"EXIT_CODE=$?\")",
+      "Bash(pio pkg:*)",
+      "Bash(ls -la /home/maxat/Projects/NU/Temp_monitoring/platform_test/pio_espidf/.pio/build/esp32c6_espidf/*.bin)",
+      "Bash(fuser /dev/ttyACM0)",
+      "Read(//dev/**)",
+      "Bash(ps -p 186301 -o comm,cmd)",
+      "Bash(kill 186301)"
+    ]
+  }
+}
