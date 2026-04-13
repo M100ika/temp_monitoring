@@ -16,7 +16,9 @@
       "Bash(fuser /dev/ttyACM0)",
       "Read(//dev/**)",
       "Bash(ps -p 186301 -o comm,cmd)",
-      "Bash(kill 186301)"
+      "Bash(kill 186301)",
+      "Bash(git clone:*)",
+      "Bash(fuser -k /dev/ttyACM0)"
     ]
   }
 }

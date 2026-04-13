@@ -5,7 +5,7 @@
         "--device=/dev/ttyACM0:/dev/ttyACM0",
         "--privileged"
     ],
-    "postCreateCommand": "apt-get update && apt-get install -y git curl && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && apt-get install -y nodejs && pip install platformio && npm install -g @anthropic-ai/claude-code",
+    "postCreateCommand": "apt-get update && apt-get install -y git curl && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && apt-get install -y nodejs && pip install platformio && npm install -g @anthropic-ai/claude-code && usermod -aG dialout vscode && chmod a+rw /dev/ttyACM0",
     "customizations": {
         "vscode": {
             "extensions": [
@@ -15,5 +15,5 @@
             ]
         }
     },
-    "remoteUser": "root"
+    "remoteUser": "vscode"
 }

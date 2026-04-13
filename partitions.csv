@@ -1,0 +1,7 @@
+# ESP32-C6  8 MB Flash – single-app, no OTA
+# Total usable: 0x800000 (8 388 608 bytes)
+#
+# Name,     Type,  SubType,  Offset,   Size,      Flags
+nvs,        data,  nvs,      0x9000,   0x5000,
+phy_init,   data,  phy,      0xF000,   0x1000,
+factory,    app,   factory,  0x10000,  0x7F0000,
