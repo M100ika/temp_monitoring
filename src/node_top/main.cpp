@@ -1,6 +1,7 @@
 /**
  * Node Top Firmware  —  ESP32-C6
- * 4× MAX31855 (soft-SPI) | LCD 1.47" ST7789 landscape via LGFX_Sprite | ESP-NOW TX
+ * 4× MAX31855 (soft-SPI) | LCD 1.47" ST7789 landscape via LGFX_Sprite
+ * ESP-NOW RX (node_bottom data) + TX (wake commands) | Serial JSON → USB-CDC → PC
  *
  * Waveshare ESP32-C6-LCD-1.47 pinout (verified):
  *   LCD:     MOSI=6   SCLK=7   CS=14  DC=15  RST=21  BL=22
@@ -8,29 +9,22 @@
  *   Buttons: BTN0=0   BTN1=1   BTN2=2  BTN3=3  (INPUT_PULLUP)
  *
  * Button actions:
- *   BTN0 (GPIO 0) — cycle display pages:
- *                   Page 0 = Grid  (2×2 zones, current reading)
- *                   Page 1 = Stats (NOW / MIN / MAX table)
- *   BTN1 (GPIO 1) — toggle temperature unit  °C ↔ °F
- *   BTN2 (GPIO 2) — backlight brightness  100% → 50% → 15% → 100%
- *   BTN3 (GPIO 3) — reset MIN / MAX history for all sensors
+ *   BTN0 — cycle pages (Grid / Stats)
+ *   BTN1 — toggle °C / °F
+ *   BTN2 — backlight brightness  100% → 50% → 15% → 100%
+ *   BTN3 — reset MIN / MAX history
+ *   Any  — wake display + broadcast wake command to node_bottom
  *
- * Display layout — Page 0 (320×172, rotation=1):
- *   ┌──────────────┬──────────────┐
- *   │ T1  xx.x°C   │ T2  xx.x°C   │  each zone 160×86
- *   ├──────────────┼──────────────┤
- *   │ T3  xx.x°C   │ T4  xx.x°C   │
- *   └──────────────┴──────────────┘
+ * Display sleep:
+ *   Auto-sleep after DISPLAY_SLEEP_TIMEOUT_MS of button inactivity.
+ *   Any button press wakes this display and broadcasts NODE_CMD_WAKE_DISPLAY.
  *
- * Display layout — Page 1 (Stats):
- *   ┌────┬──────────┬──────────┬──────────┐
- *   │ C  │   NOW    │   MIN    │   MAX    │  header row
- *   ├────┼──────────┼──────────┼──────────┤
- *   │ T1 │  xx.x    │  xx.x    │  xx.x    │
- *   │ T2 │  xx.x    │  xx.x    │  xx.x    │
- *   │ T3 │  xx.x    │  xx.x    │  xx.x    │
- *   │ T4 │  xx.x    │  xx.x    │  xx.x    │
- *   └────┴──────────┴──────────┴──────────┘
+ * Data flow:
+ *   node_bottom → ESP-NOW → [recv_cb] ─┐
+ *   own sensors  → soft-SPI ────────────┴→ JSON → USB-CDC → PC
+ *
+ * JSON output (every 200 ms):
+ *   {"timestamp":12345,"top":[T1,T2,T3,T4],"bottom":[T5],"status":"OK"}
  */
 
 #include <stdio.h>
@@ -38,6 +32,7 @@
 #include <math.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 #include "driver/gpio.h"
 #include "driver/ledc.h"
 #include "esp_timer.h"
@@ -62,54 +57,63 @@ static const gpio_num_t CS_PINS[4] = {
 #define LCD_BL_PIN   GPIO_NUM_22
 #define LCD_RST_PIN  GPIO_NUM_21
 
-#define BTN0_PIN     GPIO_NUM_0   // cycle page
-#define BTN1_PIN     GPIO_NUM_1   // toggle °C / °F
-#define BTN2_PIN     GPIO_NUM_2   // backlight brightness
-#define BTN3_PIN     GPIO_NUM_3   // reset min/max stats
-
-static const uint8_t BROADCAST_MAC[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+#define BTN0_PIN     GPIO_NUM_0
+#define BTN1_PIN     GPIO_NUM_1
+#define BTN2_PIN     GPIO_NUM_2
+#define BTN3_PIN     GPIO_NUM_3
 
 // ── Backlight (LEDC PWM on BL_PIN) ──────────────────────────
 #define BL_LEDC_TIMER   LEDC_TIMER_0
 #define BL_LEDC_CHANNEL LEDC_CHANNEL_0
 #define BL_LEDC_FREQ_HZ 5000u
 
-static const uint8_t BL_LEVELS[]   = {255, 128, 38};   // 100% / 50% / 15%
-static const int     BL_NUM_STEPS  = (int)(sizeof(BL_LEVELS));
+static const uint8_t BL_LEVELS[]  = {255, 128, 38};   // 100% / 50% / 15%
+static const int     BL_NUM_STEPS = (int)(sizeof(BL_LEVELS));
 
 // ── Display geometry ─────────────────────────────────────────
-// Logical screen after setRotation(1): 320 wide × 172 tall
 #define SCREEN_W  320
 #define SCREEN_H  172
-// Page 0 — 2×2 grid zones
-#define ZONE_W    (SCREEN_W / 2)   // 160
-#define ZONE_H    (SCREEN_H / 2)   //  86
+#define ZONE_W    (SCREEN_W / 2)
+#define ZONE_H    (SCREEN_H / 2)
 
-// Page 1 — stats table column geometry
-#define STATS_ROW_H    34    // header + 4 rows × 34px = 170px ≤ 172
-#define STATS_COL0_CX  20    // "Tx" label center-x
-#define STATS_COL1_CX  96    // NOW  center-x
-#define STATS_COL2_CX  193   // MIN  center-x
-#define STATS_COL3_CX  277   // MAX  center-x
-#define STATS_DIV1     39    // vertical divider after label col
-#define STATS_DIV2     152   // vertical divider after NOW col
-#define STATS_DIV3     233   // vertical divider after MIN col
+#define STATS_ROW_H    34
+#define STATS_COL0_CX  20
+#define STATS_COL1_CX  96
+#define STATS_COL2_CX  193
+#define STATS_COL3_CX  277
+#define STATS_DIV1     39
+#define STATS_DIV2     152
+#define STATS_DIV3     233
 
-// Sensor label strings — avoids snprintf / format-truncation warnings
+// ── Timeouts ─────────────────────────────────────────────────
+#define NODE_TIMEOUT_MS          1000    // node_bottom считается потерянным
+#define DISPLAY_SLEEP_TIMEOUT_MS 30000   // 30 с без кнопок → дисплей выкл
+
 static const char* const SENSOR_LABELS[4] = {"T1", "T2", "T3", "T4"};
 
+// Broadcast MAC для отправки wake-команды node_bottom
+static const uint8_t BROADCAST_MAC[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+
 // ── Runtime state ────────────────────────────────────────────
-static portMUX_TYPE      btn_mux       = portMUX_INITIALIZER_UNLOCKED;
-static volatile uint8_t  btn_flags     = 0;        // bit N = BTN_N pressed
-static int64_t           btn_last_us[4] = {};       // debounce timestamps (µs)
+static portMUX_TYPE      btn_mux        = portMUX_INITIALIZER_UNLOCKED;
+static volatile uint8_t  btn_flags      = 0;
+static int64_t           btn_last_us[4] = {};
 
-static uint8_t  display_page    = 0;    // 0=GRID, 1=STATS
+static uint8_t  display_page    = 0;
 static bool     unit_fahrenheit = false;
-static int      bl_idx          = 0;    // index into BL_LEVELS[]
+static int      bl_idx          = 0;
 
-// Per-sensor extremes (°C); reset by BTN3
-static float    t_min[4];   // initialised to +INFINITY
-static float    t_max[4];   // initialised to -INFINITY
+static float    t_min[4];
+static float    t_max[4];
+
+static bool     display_sleeping = false;
+static int64_t  last_activity_ms = 0;
+
+// ── Node_bottom shared state ─────────────────────────────────
+static SemaphoreHandle_t   s_bot_mutex;
+static espnow_packet_t     s_bot_pkt;
+static int64_t             s_bot_rx_ms = 0;
+static bool                s_bot_valid = false;
 
 // ── LovyanGFX objects ────────────────────────────────────────
 static LGFX        lcd;
@@ -122,16 +126,39 @@ static inline float to_display(float t_c)
     return unit_fahrenheit ? (t_c * 1.8f + 32.0f) : t_c;
 }
 
+static int append_float(char* buf, int pos, float v)
+{
+    if (isnan(v) || isinf(v))
+        return pos + sprintf(buf + pos, "null");
+    return pos + sprintf(buf + pos, "%.2f", (double)v);
+}
+
+// ── ESP-NOW receive callback ──────────────────────────────────
+static void espnow_recv_cb(const esp_now_recv_info_t* info,
+                           const uint8_t* data, int len)
+{
+    (void)info;
+    if (len < (int)sizeof(espnow_packet_t)) return;
+    const espnow_packet_t* pkt = (const espnow_packet_t*)data;
+    if (pkt->node_id != NODE_ID_BOTTOM) return;
+
+    int64_t now_ms = esp_timer_get_time() / 1000LL;
+    if (xSemaphoreTake(s_bot_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        s_bot_pkt    = *pkt;
+        s_bot_rx_ms  = now_ms;
+        s_bot_valid  = true;
+        xSemaphoreGive(s_bot_mutex);
+    }
+}
+
 // ── Button ISR ───────────────────────────────────────────────
 static void IRAM_ATTR btn_isr_handler(void* arg)
 {
     const int btn = (int)(intptr_t)arg;
     static const gpio_num_t PINS[] = {BTN0_PIN, BTN1_PIN, BTN2_PIN, BTN3_PIN};
 
-    // 50 ms hardware debounce — ignore bounces
     int64_t now_us = esp_timer_get_time();
     if (now_us - btn_last_us[btn] < 50000LL) return;
-    // Confirm pin is still LOW (not a transient spike)
     if (gpio_get_level(PINS[btn]) != 0) return;
 
     btn_last_us[btn] = now_us;
@@ -203,7 +230,7 @@ static void bl_init(void)
     ch.channel    = BL_LEDC_CHANNEL;
     ch.intr_type  = LEDC_INTR_DISABLE;
     ch.timer_sel  = BL_LEDC_TIMER;
-    ch.duty       = BL_LEVELS[0];   // full brightness on boot
+    ch.duty       = BL_LEVELS[0];
     ch.hpoint     = 0;
     ledc_channel_config(&ch);
 }
@@ -214,6 +241,19 @@ static void bl_set(uint8_t level)
     ledc_update_duty(LEDC_LOW_SPEED_MODE, BL_LEDC_CHANNEL);
 }
 
+// ── Display sleep / wake ─────────────────────────────────────
+static void display_sleep_start(void)
+{
+    display_sleeping = true;
+    bl_set(0);
+}
+
+static void display_wake(void)
+{
+    display_sleeping = false;
+    bl_set(BL_LEVELS[bl_idx]);
+}
+
 // ── Button GPIO init ─────────────────────────────────────────
 static void buttons_init(void)
 {
@@ -221,7 +261,7 @@ static void buttons_init(void)
     io.mode         = GPIO_MODE_INPUT;
     io.pull_up_en   = GPIO_PULLUP_ENABLE;
     io.pull_down_en = GPIO_PULLDOWN_DISABLE;
-    io.intr_type    = GPIO_INTR_NEGEDGE;   // falling edge = press
+    io.intr_type    = GPIO_INTR_NEGEDGE;
     io.pin_bit_mask = (1ULL << BTN0_PIN) | (1ULL << BTN1_PIN) |
                       (1ULL << BTN2_PIN) | (1ULL << BTN3_PIN);
     gpio_config(&io);
@@ -256,17 +296,20 @@ static void wifi_espnow_init(void)
     ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_start());
+    ESP_ERROR_CHECK(esp_wifi_set_max_tx_power(40));
     ESP_ERROR_CHECK(esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE));
 
     ESP_ERROR_CHECK(esp_now_init());
+    ESP_ERROR_CHECK(esp_now_register_recv_cb(espnow_recv_cb));
 
+    // Broadcast peer — для отправки wake-команды node_bottom
     esp_now_peer_info_t peer = {};
     memcpy(peer.peer_addr, BROADCAST_MAC, 6);
     peer.channel = 0;
     peer.encrypt = false;
     ESP_ERROR_CHECK(esp_now_add_peer(&peer));
 
-    ESP_LOGI(TAG, "Wi-Fi / ESP-NOW ready");
+    ESP_LOGI(TAG, "Wi-Fi / ESP-NOW ready (RX + TX wake)");
 }
 
 // ── Display — Page 0: 2×2 grid ──────────────────────────────
@@ -279,13 +322,11 @@ static void draw_zone(int idx, float temp)
 
     canvas.fillRect(zx, zy, ZONE_W, ZONE_H, TFT_BLACK);
 
-    // "T1"…"T4" label — top-left of zone
     canvas.setTextDatum(lgfx::top_left);
     canvas.setTextSize(2);
     canvas.setTextColor(TFT_CYAN, TFT_BLACK);
     canvas.drawString(SENSOR_LABELS[idx], zx + 5, zy + 4);
 
-    // Temperature value — centered in zone
     canvas.setTextDatum(lgfx::middle_center);
     canvas.setTextSize(3);
     float t_disp = to_display(temp);
@@ -306,14 +347,11 @@ static void draw_stats_page(const float temps[4])
 {
     canvas.fillScreen(TFT_BLACK);
 
-    // Vertical column dividers
     canvas.drawFastVLine(STATS_DIV1, 0, SCREEN_H, TFT_DARKGREY);
     canvas.drawFastVLine(STATS_DIV2, 0, SCREEN_H, TFT_DARKGREY);
     canvas.drawFastVLine(STATS_DIV3, 0, SCREEN_H, TFT_DARKGREY);
-    // Horizontal divider under header row
     canvas.drawFastHLine(0, STATS_ROW_H, SCREEN_W, TFT_DARKGREY);
 
-    // Header row
     canvas.setTextDatum(lgfx::middle_center);
     canvas.setTextSize(1);
     canvas.setTextColor(TFT_DARKGREY, TFT_BLACK);
@@ -323,21 +361,17 @@ static void draw_stats_page(const float temps[4])
     canvas.drawString("MIN",  STATS_COL2_CX, STATS_ROW_H / 2);
     canvas.drawString("MAX",  STATS_COL3_CX, STATS_ROW_H / 2);
 
-    // Data rows T1…T4
     for (int i = 0; i < 4; i++) {
         int y_c = (i + 1) * STATS_ROW_H + STATS_ROW_H / 2;
 
-        // Apply unit conversion (sentinel ±INFINITY stays non-finite)
         float t_disp = to_display(temps[i]);
         float mn     = to_display(t_min[i]);
         float mx     = to_display(t_max[i]);
 
-        // Sensor label
         canvas.setTextSize(2);
         canvas.setTextColor(TFT_CYAN, TFT_BLACK);
         canvas.drawString(SENSOR_LABELS[i], STATS_COL0_CX, y_c);
 
-        // NOW column
         if (isnan(t_disp)) {
             canvas.setTextColor(TFT_RED, TFT_BLACK);
             canvas.drawString("ERR", STATS_COL1_CX, y_c);
@@ -348,7 +382,6 @@ static void draw_stats_page(const float temps[4])
             canvas.drawString(buf, STATS_COL1_CX, y_c);
         }
 
-        // MIN column — "---" until first valid reading
         if (isinf(mn)) {
             canvas.setTextColor(TFT_DARKGREY, TFT_BLACK);
             canvas.drawString("---", STATS_COL2_CX, y_c);
@@ -359,7 +392,6 @@ static void draw_stats_page(const float temps[4])
             canvas.drawString(buf, STATS_COL2_CX, y_c);
         }
 
-        // MAX column — "---" until first valid reading
         if (isinf(mx)) {
             canvas.setTextColor(TFT_DARKGREY, TFT_BLACK);
             canvas.drawString("---", STATS_COL3_CX, y_c);
@@ -386,8 +418,6 @@ static void draw_screen(const float temps[4])
         draw_stats_page(temps);
     }
 
-    // Page indicator: 2 dots at bottom-center
-    // Left dot = Page 0 (GRID), right dot = Page 1 (STATS)
     canvas.fillCircle(SCREEN_W / 2 - 6, SCREEN_H - 4, 3,
                       display_page == 0 ? TFT_WHITE : TFT_DARKGREY);
     canvas.fillCircle(SCREEN_W / 2 + 6, SCREEN_H - 4, 3,
@@ -414,6 +444,7 @@ static void draw_splash(const char* line1, const char* line2)
 static void main_task(void* /*arg*/)
 {
     float temps[4];
+    static char line[256];
     TickType_t last_wake = xTaskGetTickCount();
 
     for (;;) {
@@ -424,27 +455,41 @@ static void main_task(void* /*arg*/)
         btn_flags = 0;
         portEXIT_CRITICAL(&btn_mux);
 
-        if (flags & (1u << 0)) {                       // BTN0 — cycle page
-            display_page = (display_page + 1) % 2;
-            ESP_LOGI(TAG, "Page → %d (%s)",
-                     display_page, display_page == 0 ? "GRID" : "STATS");
+        if (flags) {
+            // Любая кнопка: сбросить таймер сна
+            last_activity_ms = esp_timer_get_time() / 1000LL;
+            if (display_sleeping) {
+                display_wake();
+                // Сообщить node_bottom о пробуждении
+                espnow_cmd_t wake_cmd = {};
+                wake_cmd.node_id = NODE_ID_TOP;
+                wake_cmd.cmd     = NODE_CMD_WAKE_DISPLAY;
+                esp_now_send(BROADCAST_MAC,
+                             (const uint8_t*)&wake_cmd, sizeof(wake_cmd));
+                ESP_LOGI(TAG, "Display woke, wake cmd sent to bottom");
+            }
         }
-        if (flags & (1u << 1)) {                       // BTN1 — toggle unit
+
+        if (flags & (1u << 0)) {
+            display_page = (display_page + 1) % 2;
+            ESP_LOGI(TAG, "Page → %d", display_page);
+        }
+        if (flags & (1u << 1)) {
             unit_fahrenheit = !unit_fahrenheit;
             ESP_LOGI(TAG, "Unit → %s", unit_fahrenheit ? "°F" : "°C");
         }
-        if (flags & (1u << 2)) {                       // BTN2 — brightness
+        if (flags & (1u << 2)) {
             bl_idx = (bl_idx + 1) % BL_NUM_STEPS;
-            bl_set(BL_LEVELS[bl_idx]);
+            if (!display_sleeping) bl_set(BL_LEVELS[bl_idx]);
             ESP_LOGI(TAG, "Backlight → %d%%",
                      (int)(BL_LEVELS[bl_idx] * 100 / 255));
         }
-        if (flags & (1u << 3)) {                       // BTN3 — reset min/max
+        if (flags & (1u << 3)) {
             for (int i = 0; i < 4; i++) {
                 t_min[i] =  INFINITY;
                 t_max[i] = -INFINITY;
             }
-            ESP_LOGI(TAG, "Min/Max history reset");
+            ESP_LOGI(TAG, "Min/Max reset");
         }
 
         // ── 2. Read all 4 sensors ────────────────────────────
@@ -455,33 +500,58 @@ static void main_task(void* /*arg*/)
             if (isnan(temps[i])) {
                 err_mask |= (uint8_t)(1 << i);
             } else {
-                // Update per-sensor extremes (always in °C)
                 if (temps[i] < t_min[i]) t_min[i] = temps[i];
                 if (temps[i] > t_max[i]) t_max[i] = temps[i];
             }
         }
 
-        // ── 3. Update display ────────────────────────────────
-        draw_screen(temps);
+        // ── 3. Update display (пропустить если спит) ─────────
+        if (!display_sleeping) {
+            draw_screen(temps);
+        }
 
-        // ── 4. Send via ESP-NOW (raw °C — gateway converts if needed) ──
-        espnow_packet_t pkt = {};
-        pkt.node_id      = NODE_ID_TOP;
-        pkt.timestamp_ms = (uint32_t)(esp_timer_get_time() / 1000ULL);
-        memcpy(pkt.temps, temps, sizeof(float) * 4);
-        pkt.num_sensors  = 4;
-        pkt.status       = err_mask ? STATUS_ERR_SENS : STATUS_OK;
+        // ── 4. Snapshot node_bottom data ─────────────────────
+        int64_t now_ms = esp_timer_get_time() / 1000LL;
+        espnow_packet_t bot_snap;
+        int64_t         bot_rx;
+        bool            bot_valid_snap;
+        xSemaphoreTake(s_bot_mutex, portMAX_DELAY);
+        bot_snap       = s_bot_pkt;
+        bot_rx         = s_bot_rx_ms;
+        bot_valid_snap = s_bot_valid;
+        xSemaphoreGive(s_bot_mutex);
 
-        esp_err_t ret = esp_now_send(BROADCAST_MAC,
-                                     (const uint8_t*)&pkt, sizeof(pkt));
-        if (ret != ESP_OK)
-            ESP_LOGW(TAG, "esp_now_send: %s", esp_err_to_name(ret));
+        bool bot_alive = bot_valid_snap && (now_ms - bot_rx < NODE_TIMEOUT_MS);
 
-        ESP_LOGI(TAG, "T1=%.1f T2=%.1f T3=%.1f T4=%.1f",
-                 (double)temps[0], (double)temps[1],
-                 (double)temps[2], (double)temps[3]);
+        // ── 5. Output JSON to USB-Serial ─────────────────────
+        int p = 0;
+        p += sprintf(line + p, "{\"timestamp\":%lld,\"top\":[",
+                     (long long)now_ms);
+        for (int i = 0; i < 4; i++) {
+            if (i > 0) line[p++] = ',';
+            p = append_float(line, p, temps[i]);
+        }
+        p += sprintf(line + p, "],\"bottom\":[");
+        p = append_float(line, p, bot_alive ? bot_snap.temps[0] : NAN);
 
-        // ── 5. Precise 200 ms period ─────────────────────────
+        const char* status;
+        bool bot_err = bot_alive && (bot_snap.status != STATUS_OK);
+        if (!bot_alive)               status = "BOT_TIMEOUT";
+        else if (err_mask || bot_err) status = "SENSOR_ERR";
+        else                          status = "OK";
+
+        p += sprintf(line + p, "],\"status\":\"%s\"}\n", status);
+        fputs(line, stdout);
+        fflush(stdout);
+
+        // ── 6. Auto-sleep check ──────────────────────────────
+        if (!display_sleeping &&
+            (now_ms - last_activity_ms >= DISPLAY_SLEEP_TIMEOUT_MS)) {
+            display_sleep_start();
+            ESP_LOGI(TAG, "Display sleep (inactivity)");
+        }
+
+        // ── 7. Precise 200 ms period ─────────────────────────
         vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(200));
     }
 }
@@ -489,15 +559,16 @@ static void main_task(void* /*arg*/)
 // ── Entry point ──────────────────────────────────────────────
 extern "C" void app_main(void)
 {
-    // Allow USB-CDC monitor to attach
     vTaskDelay(pdMS_TO_TICKS(1500));
     ESP_LOGI(TAG, "=== Node Top starting ===");
 
-    // Initialise per-sensor extremes to sentinel values
     for (int i = 0; i < 4; i++) {
         t_min[i] =  INFINITY;
         t_max[i] = -INFINITY;
     }
+
+    s_bot_mutex      = xSemaphoreCreateMutex();
+    last_activity_ms = esp_timer_get_time() / 1000LL;
 
     // ── Step 1: Sensor GPIO ──────────────────────────────────
     spi_sens_init();
@@ -505,21 +576,21 @@ extern "C" void app_main(void)
 
     // ── Step 2: Display hardware reset ──────────────────────
     gpio_set_direction(LCD_RST_PIN, GPIO_MODE_OUTPUT);
-    gpio_set_level    (LCD_RST_PIN, 0);            // assert reset
+    gpio_set_level    (LCD_RST_PIN, 0);
     vTaskDelay(pdMS_TO_TICKS(50));
-    gpio_set_level    (LCD_RST_PIN, 1);            // release reset
-    vTaskDelay(pdMS_TO_TICKS(150));                // ST7789 power-on time
+    gpio_set_level    (LCD_RST_PIN, 1);
+    vTaskDelay(pdMS_TO_TICKS(150));
     ESP_LOGI(TAG, "Display HW reset done");
 
     // ── Step 3: Backlight PWM ────────────────────────────────
     bl_init();
-    ESP_LOGI(TAG, "Backlight LEDC OK (full brightness)");
+    ESP_LOGI(TAG, "Backlight LEDC OK");
 
     // ── Step 4: LovyanGFX init ───────────────────────────────
     lcd.init();
-    lcd.setRotation(1);    // landscape → 320×172
+    lcd.setRotation(1);
 
-    canvas.setColorDepth(8);   // 8-bit: 320×172×1 = 54 KB (vs 107 KB 16-bit)
+    canvas.setColorDepth(8);
     if (canvas.createSprite(SCREEN_W, SCREEN_H) == nullptr) {
         ESP_LOGE(TAG, "Sprite alloc FAILED – halting");
         for (;;) vTaskDelay(pdMS_TO_TICKS(1000));
@@ -528,13 +599,11 @@ extern "C" void app_main(void)
 
     // ── Step 5: Boot splash ──────────────────────────────────
     draw_splash("NODE TOP", "Initialising...");
-    ESP_LOGI(TAG, "Splash displayed");
 
     // ── Step 6: Button GPIO + ISR ────────────────────────────
     buttons_init();
 
     // ── Step 7: Wi-Fi / ESP-NOW ──────────────────────────────
-    ESP_LOGI(TAG, "Starting Wi-Fi...");
     wifi_espnow_init();
 
     // ── Step 8: First real sensor frame ──────────────────────

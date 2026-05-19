@@ -23,3 +23,11 @@ typedef struct __attribute__((packed)) {
     uint8_t  num_sensors;           // valid entries in temps[]
     uint8_t  status;                // STATUS_* bitmask
 } espnow_packet_t;
+
+// Command packet (node_top → broadcast, 2 bytes)
+#define NODE_CMD_WAKE_DISPLAY  0x01
+
+typedef struct __attribute__((packed)) {
+    uint8_t node_id;   // NODE_ID_TOP
+    uint8_t cmd;       // NODE_CMD_*
+} espnow_cmd_t;

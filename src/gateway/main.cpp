@@ -70,19 +70,28 @@ static void espnow_recv_cb(const esp_now_recv_info_t* info,
 // ──────────────────────────────────────────────────────────────
 static void wifi_espnow_init(void)
 {
-    nvs_flash_init();
-    esp_netif_init();
-    esp_event_loop_create_default();
+    esp_err_t nvs_ret = nvs_flash_init();
+    if (nvs_ret == ESP_ERR_NVS_NO_FREE_PAGES ||
+        nvs_ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_LOGW(TAG, "NVS corrupt – erasing");
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        nvs_ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(nvs_ret);
+
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
 
     wifi_init_config_t wifi_cfg = WIFI_INIT_CONFIG_DEFAULT();
-    esp_wifi_init(&wifi_cfg);
-    esp_wifi_set_storage(WIFI_STORAGE_RAM);
-    esp_wifi_set_mode(WIFI_MODE_STA);
-    esp_wifi_start();
-    esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
+    ESP_ERROR_CHECK(esp_wifi_init(&wifi_cfg));
+    ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_start());
+    ESP_ERROR_CHECK(esp_wifi_set_max_tx_power(40));   // 10 dBm вместо 20 dBm по умолчанию
+    ESP_ERROR_CHECK(esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE));
 
-    esp_now_init();
-    esp_now_register_recv_cb(espnow_recv_cb);
+    ESP_ERROR_CHECK(esp_now_init());
+    ESP_ERROR_CHECK(esp_now_register_recv_cb(espnow_recv_cb));
 
     // Print own MAC so nodes can target it directly if needed
     uint8_t mac[6];
@@ -108,6 +117,7 @@ static int append_float(char* buf, int pos, float v)
 static void output_task(void* /*arg*/)
 {
     static char line[256];
+    TickType_t last_wake = xTaskGetTickCount();
 
     for (;;) {
         int64_t now_ms = esp_timer_get_time() / 1000LL;
@@ -164,7 +174,7 @@ static void output_task(void* /*arg*/)
         fputs(line, stdout);
         fflush(stdout);
 
-        vTaskDelay(pdMS_TO_TICKS(JSON_PERIOD_MS));
+        vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(JSON_PERIOD_MS));
     }
 }
 

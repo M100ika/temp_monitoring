@@ -141,6 +141,10 @@ class MainWindow(QMainWindow):
         self._btn_log.setCheckable(True)
         toolbar.addWidget(self._btn_log)
 
+        self._btn_clear = QPushButton("Clear")
+        self._btn_clear.clicked.connect(self._clear_data)
+        toolbar.addWidget(self._btn_clear)
+
         toolbar.addStretch()
 
         self._lbl_status = QLabel("Disconnected")
@@ -294,21 +298,37 @@ class MainWindow(QMainWindow):
             item = QTableWidgetItem(txt)
             item.setTextAlignment(Qt.AlignCenter)
             if col == 6:  # status cell
-                item.setForeground(QColor("lime") if status == "OK"
-                                   else QColor("tomato"))
+                if status == "OK":
+                    item.setForeground(QColor("lime"))
+                elif "TIMEOUT" in status:
+                    item.setForeground(QColor("orange"))
+                else:
+                    item.setForeground(QColor("tomato"))
             self._table.setItem(0, col, item)
 
         # CSV logging
         if self._logging and self._csv_writer:
             ts_str = datetime.fromtimestamp(rx).isoformat(timespec="milliseconds")
+            def _cv(v): return "" if v is None else v
             self._csv_writer.writerow([
                 ts_str,
-                top[0], top[1], top[2], top[3],
-                bottom[0],
+                _cv(top[0]), _cv(top[1]), _cv(top[2]), _cv(top[3]),
+                _cv(bottom[0]),
                 status,
             ])
 
         self._pkt_count += 1
+
+    # ── Clear graphs ─────────────────────────────────────────
+    def _clear_data(self):
+        self._times.clear()
+        for d in self._temps:
+            d.clear()
+        self._t0          = None
+        self._pkt_count   = 0
+        self._rate_count_last = 0
+        for curve in self._curves:
+            curve.setData([], [])
 
     # ── Logging ──────────────────────────────────────────────
     def _toggle_logging(self, checked: bool):

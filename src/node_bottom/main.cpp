@@ -4,7 +4,10 @@
  *
  * Waveshare ESP32-C6-LCD-1.47 pinout (verified):
  *   LCD  : MOSI=6  SCLK=7  CS=14  DC=15  RST=21  BL=22
- *   Sensor soft-SPI : CLK=GPIO8  MISO=GPIO9  CS=GPIO18
+ *   Sensor soft-SPI : CLK=GPIO5  MISO=GPIO9  CS=GPIO18
+ *
+ * Нет кнопок. Дисплей засыпает через DISPLAY_SLEEP_TIMEOUT_MS.
+ * Пробуждение — только по ESP-NOW команде NODE_CMD_WAKE_DISPLAY от node_top.
  */
 
 #include <stdio.h>
@@ -36,6 +39,14 @@ static const uint8_t BROADCAST_MAC[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
 
 #define SCREEN_W  320
 #define SCREEN_H  172
+
+// ── Timeout ──────────────────────────────────────────────────
+#define DISPLAY_SLEEP_TIMEOUT_MS  30000   // 30 с без wake-команды → дисплей выкл
+
+// ── Display sleep state ──────────────────────────────────────
+static volatile bool s_wake_requested = false;   // set in recv_cb, cleared in main_task
+static bool          display_sleeping  = false;
+static int64_t       last_activity_ms  = 0;
 
 // ── LovyanGFX objects ────────────────────────────────────────
 static LGFX        lcd;
@@ -86,10 +97,34 @@ static float max31855_parse(uint32_t raw)
     return t14 * 0.25f;
 }
 
+// ── Display sleep / wake ─────────────────────────────────────
+static void display_sleep_start(void)
+{
+    display_sleeping = true;
+    gpio_set_level(LCD_BL_PIN, 0);
+}
+
+static void display_wake(void)
+{
+    display_sleeping = false;
+    gpio_set_level(LCD_BL_PIN, 1);
+}
+
+// ── ESP-NOW receive callback ──────────────────────────────────
+// Запускается в контексте Wi-Fi задачи; пишет только volatile флаг.
+static void espnow_recv_cb(const esp_now_recv_info_t* info,
+                           const uint8_t* data, int len)
+{
+    (void)info;
+    if (len != (int)sizeof(espnow_cmd_t)) return;
+    const espnow_cmd_t* cmd = (const espnow_cmd_t*)data;
+    if (cmd->node_id == NODE_ID_TOP && cmd->cmd == NODE_CMD_WAKE_DISPLAY)
+        s_wake_requested = true;
+}
+
 // ── Wi-Fi / ESP-NOW ──────────────────────────────────────────
 static void wifi_espnow_init(void)
 {
-    // NVS: erase and retry if partition is corrupt or version-mismatched
     esp_err_t nvs_ret = nvs_flash_init();
     if (nvs_ret == ESP_ERR_NVS_NO_FREE_PAGES ||
         nvs_ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -107,9 +142,11 @@ static void wifi_espnow_init(void)
     ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_start());
+    ESP_ERROR_CHECK(esp_wifi_set_max_tx_power(40));   // 10 dBm
     ESP_ERROR_CHECK(esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE));
 
     ESP_ERROR_CHECK(esp_now_init());
+    ESP_ERROR_CHECK(esp_now_register_recv_cb(espnow_recv_cb));
 
     esp_now_peer_info_t peer = {};
     memcpy(peer.peer_addr, BROADCAST_MAC, 6);
@@ -120,7 +157,7 @@ static void wifi_espnow_init(void)
     ESP_LOGI(TAG, "Wi-Fi / ESP-NOW ready");
 }
 
-// ── Display (sprite → pushSprite, no flicker) ────────────────
+// ── Display ──────────────────────────────────────────────────
 static void draw_screen(float temp)
 {
     if (canvas.getBuffer() == nullptr) return;
@@ -129,20 +166,17 @@ static void draw_screen(float temp)
 
     canvas.fillScreen(TFT_BLACK);
 
-    // Header
     canvas.setTextDatum(lgfx::top_center);
     canvas.setTextSize(2);
     canvas.setTextColor(0xFD20u, TFT_BLACK);   // orange
     canvas.drawString("BOTTOM NODE", cx, 10);
     canvas.drawFastHLine(0, 35, SCREEN_W, TFT_DARKGREY);
 
-    // "T5:" label
     canvas.setTextDatum(lgfx::top_center);
     canvas.setTextSize(2);
     canvas.setTextColor(TFT_WHITE, TFT_BLACK);
     canvas.drawString("T5:", cx, 45);
 
-    // Large temperature value
     canvas.setTextDatum(lgfx::middle_center);
     canvas.setTextSize(4);
     if (isnan(temp)) {
@@ -164,7 +198,7 @@ static void draw_splash(const char* line1, const char* line2)
     canvas.fillScreen(TFT_BLACK);
     canvas.setTextDatum(lgfx::middle_center);
     canvas.setTextSize(2);
-    canvas.setTextColor(0xFD20u, TFT_BLACK);   // orange
+    canvas.setTextColor(0xFD20u, TFT_BLACK);
     canvas.drawString(line1, SCREEN_W / 2, SCREEN_H / 2 - 14);
     canvas.setTextSize(1);
     canvas.setTextColor(TFT_DARKGREY, TFT_BLACK);
@@ -176,12 +210,28 @@ static void draw_splash(const char* line1, const char* line2)
 static void main_task(void* /*arg*/)
 {
     TickType_t last_wake = xTaskGetTickCount();
+
     for (;;) {
+        // ── 1. Handle wake command от node_top ───────────────
+        if (s_wake_requested) {
+            s_wake_requested = false;
+            last_activity_ms = esp_timer_get_time() / 1000LL;
+            if (display_sleeping) {
+                display_wake();
+                ESP_LOGI(TAG, "Display woke by node_top");
+            }
+        }
+
+        // ── 2. Read sensor ───────────────────────────────────
         uint32_t raw = max31855_read_raw();
         float temp   = max31855_parse(raw);
 
-        draw_screen(temp);
+        // ── 3. Update display (пропустить если спит) ─────────
+        if (!display_sleeping) {
+            draw_screen(temp);
+        }
 
+        // ── 4. Send ESP-NOW packet ───────────────────────────
         espnow_packet_t pkt = {};
         pkt.node_id      = NODE_ID_BOTTOM;
         pkt.timestamp_ms = (uint32_t)(esp_timer_get_time() / 1000ULL);
@@ -196,6 +246,15 @@ static void main_task(void* /*arg*/)
 
         ESP_LOGI(TAG, "T5=%.2f°C", (double)temp);
 
+        // ── 5. Auto-sleep check ──────────────────────────────
+        int64_t now_ms = esp_timer_get_time() / 1000LL;
+        if (!display_sleeping &&
+            (now_ms - last_activity_ms >= DISPLAY_SLEEP_TIMEOUT_MS)) {
+            display_sleep_start();
+            ESP_LOGI(TAG, "Display sleep (inactivity)");
+        }
+
+        // ── 6. Precise 200 ms period ─────────────────────────
         vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(200));
     }
 }
@@ -203,35 +262,30 @@ static void main_task(void* /*arg*/)
 // ── Entry point ──────────────────────────────────────────────
 extern "C" void app_main(void)
 {
-    // ── Step 0: Let USB-CDC monitor attach ───────────────────
-    // ESP32-C6 USB-Serial/JTAG needs ~1 s for the host driver to
-    // enumerate and the terminal to connect before any log output.
     vTaskDelay(pdMS_TO_TICKS(1500));
     ESP_LOGI(TAG, "=== Node Bottom starting ===");
+
+    last_activity_ms = esp_timer_get_time() / 1000LL;
 
     // ── Step 1: Sensor GPIO ──────────────────────────────────
     spi_sens_init();
     ESP_LOGI(TAG, "Sensor SPI init OK");
 
     // ── Step 2: Display power + hardware reset ───────────────
-    // Drive BL and RST directly so the display is fully ready
-    // before handing control to LovyanGFX.
     gpio_set_direction(LCD_BL_PIN,  GPIO_MODE_OUTPUT);
     gpio_set_level    (LCD_BL_PIN,  1);                // backlight on
 
     gpio_set_direction(LCD_RST_PIN, GPIO_MODE_OUTPUT);
-    gpio_set_level    (LCD_RST_PIN, 0);                // assert reset
+    gpio_set_level    (LCD_RST_PIN, 0);
     vTaskDelay(pdMS_TO_TICKS(50));
-    gpio_set_level    (LCD_RST_PIN, 1);                // release reset
-    vTaskDelay(pdMS_TO_TICKS(150));                    // ST7789 power-on time
+    gpio_set_level    (LCD_RST_PIN, 1);
+    vTaskDelay(pdMS_TO_TICKS(150));
     ESP_LOGI(TAG, "Display HW reset done");
 
     // ── Step 3: LovyanGFX init ───────────────────────────────
     lcd.init();
-    lcd.setRotation(1);   // landscape → 320×172
+    lcd.setRotation(1);
 
-    // 8-bit depth: 320×172×1 = 54 KB vs 107 KB for 16-bit.
-    // Prevents heap panic on 320 KB RAM chip.
     canvas.setColorDepth(8);
     if (canvas.createSprite(SCREEN_W, SCREEN_H) == nullptr) {
         ESP_LOGE(TAG, "Sprite alloc FAILED – halting");
@@ -241,16 +295,12 @@ extern "C" void app_main(void)
 
     // ── Step 4: Boot splash ──────────────────────────────────
     draw_splash("BOTTOM NODE", "Initialising...");
-    ESP_LOGI(TAG, "Splash displayed");
 
     // ── Step 5: Wi-Fi / ESP-NOW ──────────────────────────────
-    // Done after display: if this hangs, the splash is visible.
-    ESP_LOGI(TAG, "Starting Wi-Fi...");
     wifi_espnow_init();
 
     // ── Step 6: First real sensor frame ──────────────────────
-    uint32_t raw = max31855_read_raw();
-    draw_screen(max31855_parse(raw));
+    draw_screen(max31855_parse(max31855_read_raw()));
 
     // ── Step 7: Main loop ────────────────────────────────────
     ESP_LOGI(TAG, "Launching main task");

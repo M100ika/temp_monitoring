@@ -18,7 +18,12 @@
       "Bash(ps -p 186301 -o comm,cmd)",
       "Bash(kill 186301)",
       "Bash(git clone:*)",
-      "Bash(fuser -k /dev/ttyACM0)"
+      "Bash(fuser -k /dev/ttyACM0)",
+      "Bash(git *)",
+      "Bash(python create_icon.py)",
+      "Bash(python -c 'from PIL import Image; img=Image.open\\('\\\\''icon.ico'\\\\''\\); print\\('\\\\''Sizes:'\\\\'', img.info.get\\('\\\\''sizes'\\\\'', '\\\\''n/a'\\\\''\\)\\); sizes=[]; img.seek\\(0\\) *)",
+      "Bash(python -c ' *)",
+      "Bash(python *)"
     ]
   }
 }
