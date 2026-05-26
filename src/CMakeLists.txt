@@ -17,6 +17,11 @@ elseif("${NODE_TARGET}" STREQUAL "node_bottom")
     set(APP_SRCS       "node_bottom/main.cpp")
     set(APP_PRIV_REQS  esp_wifi nvs_flash esp_netif LovyanGFX)
 
+elseif("${NODE_TARGET}" STREQUAL "monitor")
+    message(STATUS "[TempMon] Building target: monitor (ESP32-WROOM-32)")
+    set(APP_SRCS       "monitor/main.cpp")
+    set(APP_PRIV_REQS  driver esp_timer LovyanGFX)
+
 else()
     # Default / explicit: gateway (no display, no LovyanGFX)
     message(STATUS "[TempMon] Building target: gateway (default)")
