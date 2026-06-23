@@ -1,22 +1,20 @@
 /**
- * monitor/main.cpp — ESP32-WROOM-32
- * 5× MAX31855 (soft-SPI) | ST7735S 1.8" 160×128 (landscape) via LovyanGFX
- * Фильтр шума: медиана(5) + EMA(α=0.3) | Serial JSON → PC
+ * monitor/main.cpp — ESP32-WROOM-32 (TempMonitor v2)
+ * 5× MAX31855, hardware SPI VSPI | Nextion 320×480, UART2
+ * Noise filter: median(5) + EMA(α=0.3) | Serial JSON → USB
+ * WiFi config via SoftAP captive portal (192.168.4.1)
  *
  * GPIO:
- *   LCD (VSPI): MOSI=23 CLK=18 CS=5 DC=22 RST=4 BL=21
- *   Датчики:    CLK=14  MISO=35  CS1=25 CS2=26 CS3=27 CS4=32 CS5=33
- *   Кнопки:     BTN0=0  BTN1=13  BTN2=16  BTN3=17  (INPUT_PULLUP)
+ *   SPI VSPI : SCK=18  MISO=19
+ *   Sensors  : CS T1=32 T2=33 T3=25 T4=26 T5=27
+ *   Nextion  : UART2 TX=17  RX=16  (5 V from VIN)
  *
- * Кнопки:
- *   BTN0 — следующая страница (Grid → Stats → Grid)
- *   BTN1 — переключить °C / °F
- *   BTN2 — яркость 100% → 50% → 15% → 100%
- *   BTN3 — сброс Min / Max
- *   Любая — пробуждение дисплея (первое нажатие только будит)
- *
- * JSON (каждые 200 мс):
- *   {"timestamp":12345,"top":[T1,T2,T3,T4],"bottom":[T5],"status":"OK"}
+ * Nextion protocol (matches display_test.py):
+ *   ESP32 → Nextion numeric var : "var_name=N\xFF\xFF\xFF"   (NO .val)
+ *   ESP32 → Nextion text comp   : "comp.txt=\"...\"\xFF\xFF\xFF"
+ *   Nextion → ESP32             : ASCII string + \xFF\xFF\xFF
+ *     WIFI_CFG | LOG_CLEAR | REFRESH_250/500/1000
+ *     TOGGLE_CF | RESET_MINMAX | HEATER_ON | HEATER_OFF
  */
 
 #include <stdio.h>
@@ -24,36 +22,39 @@
 #include <math.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "driver/spi_master.h"
+#include "driver/uart.h"
 #include "driver/gpio.h"
 #include "esp_timer.h"
 #include "esp_log.h"
-#include "lgfx_config_monitor.h"
+#include "esp_wifi.h"
+#include "esp_event.h"
+#include "esp_netif.h"
+#include "esp_http_server.h"
+#include "nvs_flash.h"
 
 static const char* TAG = "Monitor";
 
-// ── Пины датчиков ─────────────────────────────────────────────
-#define SENS_CLK   GPIO_NUM_14
-#define SENS_MISO  GPIO_NUM_35
+// ── SPI (VSPI = SPI3_HOST) ────────────────────────────────────
+#define SPI_PIN_CLK   GPIO_NUM_18
+#define SPI_PIN_MISO  GPIO_NUM_19
 
 static const gpio_num_t CS_PINS[5] = {
-    GPIO_NUM_25, GPIO_NUM_26, GPIO_NUM_27, GPIO_NUM_32, GPIO_NUM_33
+    GPIO_NUM_32, GPIO_NUM_33, GPIO_NUM_25, GPIO_NUM_26, GPIO_NUM_27
 };
 
-// ── Пины кнопок ───────────────────────────────────────────────
-#define BTN0_PIN  GPIO_NUM_0
-#define BTN1_PIN  GPIO_NUM_13
-#define BTN2_PIN  GPIO_NUM_16
-#define BTN3_PIN  GPIO_NUM_17
+static spi_device_handle_t spi_bus;
 
-// ── Экран (landscape) ─────────────────────────────────────────
-#define SCREEN_W  160
-#define SCREEN_H  128
+// ── Nextion UART2 ─────────────────────────────────────────────
+#define NXT_UART       UART_NUM_2
+#define NXT_TX         GPIO_NUM_17
+#define NXT_RX         GPIO_NUM_16
+#define NXT_BAUD_SLOW  9600
+#define NXT_BAUD_FAST  115200
+#define NXT_RX_BUF     512
+#define NXT_TX_BUF     512
 
-// ── Подсветка ─────────────────────────────────────────────────
-static const uint8_t BL_LEVELS[]  = {255, 128, 38};  // 100% / 50% / 15%
-static const int     BL_NUM_STEPS = 3;
-
-// ── Фильтр: медиана(5) + EMA ─────────────────────────────────
+// ── Фильтр: медиана(5) + EMA ──────────────────────────────────
 #define FILTER_LEN  5
 #define EMA_ALPHA   0.3f
 
@@ -62,21 +63,17 @@ static int   buf_pos[5];
 static float ema_val[5];
 static bool  ema_init[5];
 
-static float median5(float arr[5]) {
-    float a[5];
-    memcpy(a, arr, sizeof(a));
-    // Insertion sort для 5 элементов
+static float median5(float a[5]) {
+    float s[5];
+    memcpy(s, a, sizeof(s));
     for (int i = 1; i < 5; i++) {
-        float key = a[i];
-        int j = i - 1;
-        while (j >= 0 && a[j] > key) { a[j + 1] = a[j]; j--; }
-        a[j + 1] = key;
+        float k = s[i]; int j = i - 1;
+        while (j >= 0 && s[j] > k) { s[j+1] = s[j]; j--; }
+        s[j+1] = k;
     }
-    return a[2];
+    return s[2];
 }
 
-// Возвращает отфильтрованное значение.
-// При первом вызове заполняет буфер текущим значением — без прогрева.
 static float filter_update(int ch, float raw) {
     if (!ema_init[ch]) {
         for (int j = 0; j < FILTER_LEN; j++) raw_buf[ch][j] = raw;
@@ -93,22 +90,22 @@ static float filter_update(int ch, float raw) {
 }
 
 // ── Состояние ─────────────────────────────────────────────────
-static LGFX        lcd;
-static LGFX_Sprite canvas(&lcd);
+static bool  unit_fahrenheit = false;
+static float t_min[5], t_max[5], t_prev[5];
+static int   heater_status = 0;
+static int   refresh_ms    = 500;
 
-static bool    unit_fahrenheit  = false;
-static uint8_t display_page    = 0;      // 0 = Grid, 1 = Stats
-static int     bl_idx          = 0;
-static float   t_min[5], t_max[5];
-static bool    display_sleeping = false;
-static int64_t last_btn_ms     = 0;
-#define SLEEP_TIMEOUT_MS  30000
+// Лог ошибок (хранится на ESP32, как в шаблоне)
+#define LOG_LINES 10
+static char log_entries[LOG_LINES][64];
+static int  log_count = 0;
 
-static portMUX_TYPE     btn_mux      = portMUX_INITIALIZER_UNLOCKED;
-static volatile uint8_t btn_flags    = 0;
-static int64_t          btn_last_us[4] = {};
-
-static const char* const SENSOR_LABELS[5] = {"T1", "T2", "T3", "T4", "T5"};
+// Запрос на WiFi-подключение из HTTP-обработчика
+static struct {
+    char ssid[64];
+    char pass[64];
+    volatile bool pending;
+} wifi_req = {};
 
 static inline float to_disp(float c) {
     return (!unit_fahrenheit || isnan(c)) ? c : c * 1.8f + 32.0f;
@@ -119,282 +116,421 @@ static int append_float(char* buf, int pos, float v) {
     return pos + sprintf(buf + pos, "%.2f", (double)v);
 }
 
-// ── Программный SPI / MAX31855 ────────────────────────────────
-static void spi_sens_init(void) {
+// ── SPI / MAX31855 ────────────────────────────────────────────
+static void spi_init(void) {
     gpio_config_t io = {};
     io.mode         = GPIO_MODE_OUTPUT;
     io.pull_up_en   = GPIO_PULLUP_DISABLE;
     io.pull_down_en = GPIO_PULLDOWN_DISABLE;
     io.intr_type    = GPIO_INTR_DISABLE;
-    io.pin_bit_mask = (1ULL << SENS_CLK);
+    io.pin_bit_mask = 0;
     for (int i = 0; i < 5; i++) io.pin_bit_mask |= (1ULL << CS_PINS[i]);
-    gpio_config(&io);
-
-    io.mode         = GPIO_MODE_INPUT;
-    io.pull_up_en   = GPIO_PULLUP_ENABLE;
-    io.pin_bit_mask = (1ULL << SENS_MISO);
-    gpio_config(&io);
-
-    gpio_set_level(SENS_CLK, 0);
+    ESP_ERROR_CHECK(gpio_config(&io));
     for (int i = 0; i < 5; i++) gpio_set_level(CS_PINS[i], 1);
+
+    spi_bus_config_t bus = {};
+    bus.mosi_io_num   = -1;
+    bus.miso_io_num   = SPI_PIN_MISO;
+    bus.sclk_io_num   = SPI_PIN_CLK;
+    bus.quadwp_io_num = -1;
+    bus.quadhd_io_num = -1;
+    bus.max_transfer_sz = 4;
+    ESP_ERROR_CHECK(spi_bus_initialize(SPI3_HOST, &bus, SPI_DMA_DISABLED));
+
+    spi_device_interface_config_t dev = {};
+    dev.mode           = 0;
+    dev.clock_speed_hz = 4 * 1000 * 1000;
+    dev.spics_io_num   = -1;
+    dev.queue_size     = 1;
+    ESP_ERROR_CHECK(spi_bus_add_device(SPI3_HOST, &dev, &spi_bus));
 }
 
-static uint32_t max31855_read_raw(gpio_num_t cs) {
-    uint32_t data = 0;
-    gpio_set_level(cs, 0);
-    esp_rom_delay_us(2);
-    for (int i = 31; i >= 0; i--) {
-        gpio_set_level(SENS_CLK, 0); esp_rom_delay_us(1);
-        if (gpio_get_level(SENS_MISO)) data |= (1UL << i);
-        gpio_set_level(SENS_CLK, 1); esp_rom_delay_us(1);
-    }
-    gpio_set_level(SENS_CLK, 0);
-    gpio_set_level(cs, 1);
-    return data;
+static uint32_t max31855_read_raw(int idx) {
+    uint8_t rx[4] = {};
+    spi_transaction_t t = {};
+    t.length    = 32;
+    t.rx_buffer = rx;
+    gpio_set_level(CS_PINS[idx], 0);
+    ESP_ERROR_CHECK(spi_device_transmit(spi_bus, &t));
+    gpio_set_level(CS_PINS[idx], 1);
+    return ((uint32_t)rx[0] << 24) | ((uint32_t)rx[1] << 16) |
+           ((uint32_t)rx[2] << 8)  |  rx[3];
 }
 
 static float max31855_parse(uint32_t raw) {
-    if (raw & 0x7) return NAN;          // fault bits: OC / SCG / SCV
+    if (raw & 0x7) return NAN;
     int16_t t14 = (int16_t)((raw >> 18) & 0x3FFF);
-    if (t14 & 0x2000) t14 |= (int16_t)0xC000;  // знаковое расширение
+    if (t14 & 0x2000) t14 |= (int16_t)0xC000;
     return t14 * 0.25f;
 }
 
-// ── Кнопки (ISR) ─────────────────────────────────────────────
-static void IRAM_ATTR btn_isr_handler(void* arg) {
-    const int btn = (int)(intptr_t)arg;
-    static const gpio_num_t PINS[] = {BTN0_PIN, BTN1_PIN, BTN2_PIN, BTN3_PIN};
+// ── Nextion: отправка ─────────────────────────────────────────
+static const uint8_t NXT_TERM[3] = {0xFF, 0xFF, 0xFF};
 
-    int64_t now_us = esp_timer_get_time();
-    if (now_us - btn_last_us[btn] < 50000LL) return;   // debounce 50 мс
-    if (gpio_get_level(PINS[btn]) != 0) return;         // шум на отпускании
-
-    btn_last_us[btn] = now_us;
-    portENTER_CRITICAL_ISR(&btn_mux);
-    btn_flags |= (uint8_t)(1u << btn);
-    portEXIT_CRITICAL_ISR(&btn_mux);
+static void nxt_cmd(const char* cmd) {
+    uart_write_bytes(NXT_UART, cmd, strlen(cmd));
+    uart_write_bytes(NXT_UART, (const char*)NXT_TERM, 3);
 }
 
-static void buttons_init(void) {
-    gpio_config_t io = {};
-    io.mode         = GPIO_MODE_INPUT;
-    io.pull_up_en   = GPIO_PULLUP_ENABLE;
-    io.pull_down_en = GPIO_PULLDOWN_DISABLE;
-    io.intr_type    = GPIO_INTR_NEGEDGE;
-    io.pin_bit_mask = (1ULL << BTN0_PIN) | (1ULL << BTN1_PIN) |
-                      (1ULL << BTN2_PIN) | (1ULL << BTN3_PIN);
-    gpio_config(&io);
-
-    gpio_install_isr_service(ESP_INTR_FLAG_IRAM);
-    gpio_isr_handler_add(BTN0_PIN, btn_isr_handler, (void*)0);
-    gpio_isr_handler_add(BTN1_PIN, btn_isr_handler, (void*)1);
-    gpio_isr_handler_add(BTN2_PIN, btn_isr_handler, (void*)2);
-    gpio_isr_handler_add(BTN3_PIN, btn_isr_handler, (void*)3);
+// Числовая глобальная переменная: "var_name=N"  (БЕЗ .val — как в display_test.py)
+static void nxt_set_var(const char* name, int val) {
+    char buf[64];
+    snprintf(buf, sizeof(buf), "%s=%d", name, val);
+    nxt_cmd(buf);
 }
 
-// ── Дисплей — Страница 0: сетка 3+2 (landscape 160×128) ──────
-//
-//  T1 (x=0..52)  | T2 (x=54..105) | T3 (x=107..159)   y=0..63
-//  ───────────────────────────────────────────────────   y=64
-//  T4 (x=0..78)  |  T5 (x=80..159)                     y=64..127
-
-struct zone_t { int16_t x, y, w, h; };
-
-static const zone_t GRID_ZONES[5] = {
-    {0,   0,  53, 64},  // T1
-    {54,  0,  52, 64},  // T2
-    {107, 0,  53, 64},  // T3
-    {0,   64, 79, 64},  // T4
-    {80,  64, 80, 64},  // T5
-};
-
-static void draw_grid_zone(int idx, float temp) {
-    const zone_t& z = GRID_ZONES[idx];
-    int cx = z.x + z.w / 2;
-    int cy = z.y + z.h / 2;
-
-    canvas.fillRect(z.x, z.y, z.w, z.h, TFT_BLACK);
-
-    // Метка датчика — левый верхний угол
-    canvas.setTextDatum(lgfx::top_left);
-    canvas.setTextSize(1);
-    canvas.setTextColor(TFT_CYAN, TFT_BLACK);
-    canvas.drawString(SENSOR_LABELS[idx], z.x + 3, z.y + 3);
-
-    // Температура — по центру зоны
-    canvas.setTextDatum(lgfx::middle_center);
-    if (isnan(temp)) {
-        canvas.setTextSize(1);
-        canvas.setTextColor(TFT_RED, TFT_BLACK);
-        canvas.drawString("ERR", cx, cy);
-    } else {
-        float t = to_disp(temp);
-        canvas.setTextSize(2);
-        canvas.setTextColor(TFT_GREEN, TFT_BLACK);
-        char buf[16];
-        snprintf(buf, sizeof(buf), "%.1f%s", (double)t, unit_fahrenheit ? "F" : "C");
-        canvas.drawString(buf, cx, cy);
-    }
+// Текстовый компонент: "comp.txt=\"...\""
+static void nxt_set_txt(const char* comp, const char* txt) {
+    char buf[128];
+    snprintf(buf, sizeof(buf), "%s.txt=\"%s\"", comp, txt);
+    nxt_cmd(buf);
 }
 
-static void draw_grid_page(const float temps[5]) {
-    canvas.fillScreen(TFT_BLACK);
+static void nxt_init(void) {
+    // Старт на 9600 (Nextion по умолчанию), затем переключаем на 115200
+    uart_config_t cfg = {};
+    cfg.baud_rate  = NXT_BAUD_SLOW;
+    cfg.data_bits  = UART_DATA_8_BITS;
+    cfg.parity     = UART_PARITY_DISABLE;
+    cfg.stop_bits  = UART_STOP_BITS_1;
+    cfg.flow_ctrl  = UART_HW_FLOWCTRL_DISABLE;
+    cfg.source_clk = UART_SCLK_APB;
+    ESP_ERROR_CHECK(uart_driver_install(NXT_UART, NXT_RX_BUF, NXT_TX_BUF, 0, NULL, 0));
+    ESP_ERROR_CHECK(uart_param_config(NXT_UART, &cfg));
+    ESP_ERROR_CHECK(uart_set_pin(NXT_UART, NXT_TX, NXT_RX,
+                                 UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
 
-    // Разделители
-    canvas.drawFastHLine(0,   64, SCREEN_W, TFT_DARKGREY);
-    canvas.drawFastVLine(53,  0,  64,       TFT_DARKGREY);
-    canvas.drawFastVLine(106, 0,  64,       TFT_DARKGREY);
-    canvas.drawFastVLine(79,  64, 64,       TFT_DARKGREY);
-
-    for (int i = 0; i < 5; i++) draw_grid_zone(i, temps[i]);
+    vTaskDelay(pdMS_TO_TICKS(500));    // ждём загрузку Nextion
+    nxt_cmd("bkcmd=0");                // отключить return codes
+    nxt_cmd("bauds=115200");           // переключить Nextion на 115200
+    vTaskDelay(pdMS_TO_TICKS(100));
+    ESP_ERROR_CHECK(uart_set_baudrate(NXT_UART, NXT_BAUD_FAST));
+    vTaskDelay(pdMS_TO_TICKS(50));
+    nxt_cmd("page 1");
 }
 
-// ── Дисплей — Страница 1: таблица Now/Min/Max ─────────────────
-//
-//  Заголовок: 28 px
-//  5 строк по 20 px: (128-28)/5 = 20
-//  Колонки: метка(0-29) NOW(30-79) MIN(80-119) MAX(120-159)
-
-#define STAT_HDR_H  28
-#define STAT_ROW_H  20
-
-static const int STAT_COL_CX[4] = {15, 55, 100, 140};
-
-static void draw_stats_page(const float temps[5]) {
-    canvas.fillScreen(TFT_BLACK);
-
-    // Вертикальные разделители
-    canvas.drawFastVLine(30,  0, SCREEN_H, TFT_DARKGREY);
-    canvas.drawFastVLine(80,  0, SCREEN_H, TFT_DARKGREY);
-    canvas.drawFastVLine(120, 0, SCREEN_H, TFT_DARKGREY);
-    // Горизонтальный под заголовком
-    canvas.drawFastHLine(0, STAT_HDR_H, SCREEN_W, TFT_DARKGREY);
-
-    // Заголовки колонок
-    canvas.setTextDatum(lgfx::middle_center);
-    canvas.setTextSize(1);
-    canvas.setTextColor(TFT_DARKGREY, TFT_BLACK);
-    canvas.drawString(unit_fahrenheit ? "F" : "C", STAT_COL_CX[0], STAT_HDR_H / 2);
-    canvas.drawString("NOW", STAT_COL_CX[1], STAT_HDR_H / 2);
-    canvas.drawString("MIN", STAT_COL_CX[2], STAT_HDR_H / 2);
-    canvas.drawString("MAX", STAT_COL_CX[3], STAT_HDR_H / 2);
-
+// ── Nextion: отправка данных датчиков ─────────────────────────
+static void nxt_send_sensors(const float temps[5]) {
+    char name[20];
     for (int i = 0; i < 5; i++) {
-        int yc = STAT_HDR_H + i * STAT_ROW_H + STAT_ROW_H / 2;
+        int n = i + 1;
 
-        if (i < 4) canvas.drawFastHLine(0, STAT_HDR_H + (i + 1) * STAT_ROW_H, SCREEN_W, TFT_DARKGREY);
+        snprintf(name, sizeof(name), "t%d_val", n);
+        nxt_set_var(name, isnan(temps[i]) ? -1 : (int)roundf(to_disp(temps[i])));
 
-        char buf[10];
-
-        // Метка
-        canvas.setTextSize(1);
-        canvas.setTextColor(TFT_CYAN, TFT_BLACK);
-        canvas.drawString(SENSOR_LABELS[i], STAT_COL_CX[0], yc);
-
-        // NOW
-        if (isnan(temps[i])) {
-            canvas.setTextColor(TFT_RED, TFT_BLACK);
-            canvas.drawString("ERR", STAT_COL_CX[1], yc);
-        } else {
-            snprintf(buf, sizeof(buf), "%.1f", (double)to_disp(temps[i]));
-            canvas.setTextColor(TFT_GREEN, TFT_BLACK);
-            canvas.drawString(buf, STAT_COL_CX[1], yc);
+        if (!isinf(t_min[i])) {
+            snprintf(name, sizeof(name), "t%d_min", n);
+            nxt_set_var(name, (int)roundf(to_disp(t_min[i])));
         }
-
-        // MIN
-        if (isinf(t_min[i])) {
-            canvas.setTextColor(TFT_DARKGREY, TFT_BLACK);
-            canvas.drawString("---", STAT_COL_CX[2], yc);
-        } else {
-            snprintf(buf, sizeof(buf), "%.1f", (double)to_disp(t_min[i]));
-            canvas.setTextColor(TFT_CYAN, TFT_BLACK);
-            canvas.drawString(buf, STAT_COL_CX[2], yc);
+        if (!isinf(t_max[i])) {
+            snprintf(name, sizeof(name), "t%d_max", n);
+            nxt_set_var(name, (int)roundf(to_disp(t_max[i])));
         }
+        if (!isnan(temps[i]) && !isnan(t_prev[i])) {
+            snprintf(name, sizeof(name), "t%d_rate", n);
+            nxt_set_var(name, (int)roundf((temps[i] - t_prev[i]) * (1000.0f / refresh_ms)));
+        }
+    }
+    nxt_set_var("heater_status", heater_status);
+}
 
-        // MAX
-        if (isinf(t_max[i])) {
-            canvas.setTextColor(TFT_DARKGREY, TFT_BLACK);
-            canvas.drawString("---", STAT_COL_CX[3], yc);
+// ── Nextion: системная информация ─────────────────────────────
+static void nxt_send_system_info(void) {
+    nxt_set_txt("espStatus", "Connected");
+
+    char mac[24] = {};
+    uint8_t m[6] = {};
+    if (esp_wifi_get_mac(WIFI_IF_STA, m) == ESP_OK) {
+        snprintf(mac, sizeof(mac), "MAC:%02X:%02X:%02X:%02X:%02X:%02X",
+                 m[0], m[1], m[2], m[3], m[4], m[5]);
+        nxt_set_txt("macAddr", mac);
+    }
+}
+
+// ── Nextion: лог ошибок ───────────────────────────────────────
+static void nxt_send_log(void) {
+    char comp[16];
+    for (int i = 0; i < LOG_LINES; i++) {
+        snprintf(comp, sizeof(comp), "log%d", i + 1);
+        nxt_set_txt(comp, log_entries[i]);
+    }
+    nxt_set_var("errCount", log_count);
+    nxt_cmd("cov errCount,errCnt.txt,0");
+}
+
+static void add_log_entry(const char* entry) {
+    for (int i = LOG_LINES - 1; i > 0; i--)
+        memcpy(log_entries[i], log_entries[i-1], sizeof(log_entries[0]));
+    snprintf(log_entries[0], sizeof(log_entries[0]), "%s", entry);
+    log_count++;
+    nxt_send_log();
+}
+
+static void clear_log(void) {
+    for (int i = 0; i < LOG_LINES; i++) log_entries[i][0] = '\0';
+    log_count = 0;
+    nxt_send_log();
+}
+
+// ── WiFi ──────────────────────────────────────────────────────
+#define WIFI_AP_SSID   "ThermalHMI_Setup"
+#define NVS_NAMESPACE  "wifi_cfg"
+
+static httpd_handle_t http_server = NULL;
+
+static const char* HTML_CONFIG =
+    "<!DOCTYPE html><html><head><meta charset='UTF-8'>"
+    "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+    "<title>WiFi Setup</title>"
+    "<style>body{font-family:sans-serif;max-width:380px;margin:40px auto;padding:0 16px}"
+    "input{width:100%;padding:8px;margin:6px 0 14px;box-sizing:border-box}"
+    "button{width:100%;padding:12px;background:#0066cc;color:#fff;"
+    "border:none;border-radius:4px;font-size:16px;cursor:pointer}</style></head>"
+    "<body><h2>ThermalHMI WiFi Setup</h2>"
+    "<form method='POST' action='/connect'>"
+    "<label>Network (SSID)</label>"
+    "<input name='ssid' required placeholder='WiFi name'>"
+    "<label>Password</label>"
+    "<input name='pass' type='password' placeholder='Password (leave blank if open)'>"
+    "<button type='submit'>Connect</button>"
+    "</form></body></html>";
+
+static const char* HTML_OK =
+    "<!DOCTYPE html><html><head><meta charset='UTF-8'><title>OK</title></head>"
+    "<body style='font-family:sans-serif;text-align:center;padding:40px'>"
+    "<h2>Connecting...</h2><p>Check the display for status.</p></body></html>";
+
+// URL-decode одного поля из application/x-www-form-urlencoded
+static void url_decode_field(const char* body, const char* key,
+                             char* out, int out_len) {
+    char search[40];
+    snprintf(search, sizeof(search), "%s=", key);
+    const char* p = strstr(body, search);
+    if (!p) { out[0] = '\0'; return; }
+    p += strlen(search);
+    int i = 0;
+    while (*p && *p != '&' && i < out_len - 1) {
+        if (*p == '+') { out[i++] = ' '; p++; }
+        else if (*p == '%' && p[1] && p[2]) {
+            char h[3] = {p[1], p[2], 0};
+            out[i++] = (char)strtol(h, NULL, 16);
+            p += 3;
         } else {
-            snprintf(buf, sizeof(buf), "%.1f", (double)to_disp(t_max[i]));
-            canvas.setTextColor(TFT_ORANGE, TFT_BLACK);
-            canvas.drawString(buf, STAT_COL_CX[3], yc);
+            out[i++] = *p++;
+        }
+    }
+    out[i] = '\0';
+}
+
+static esp_err_t http_get_handler(httpd_req_t* req) {
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_send(req, HTML_CONFIG, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+static esp_err_t http_post_handler(httpd_req_t* req) {
+    char body[256] = {};
+    int  got = httpd_req_recv(req, body, sizeof(body) - 1);
+    if (got > 0) body[got] = '\0';
+
+    // Сначала ответить, потом переключать WiFi
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_send(req, HTML_OK, HTTPD_RESP_USE_STRLEN);
+
+    if (got > 0) {
+        url_decode_field(body, "ssid", wifi_req.ssid, sizeof(wifi_req.ssid));
+        url_decode_field(body, "pass", wifi_req.pass, sizeof(wifi_req.pass));
+        if (strlen(wifi_req.ssid) > 0)
+            wifi_req.pending = true;  // main_task выполнит подключение
+    }
+    return ESP_OK;
+}
+
+static void start_http_server(void) {
+    if (http_server) return;
+    httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
+    if (httpd_start(&http_server, &cfg) != ESP_OK) {
+        ESP_LOGE(TAG, "HTTP server start failed");
+        return;
+    }
+    httpd_uri_t get_uri  = {"/",        HTTP_GET,  http_get_handler,  NULL};
+    httpd_uri_t post_uri = {"/connect", HTTP_POST, http_post_handler, NULL};
+    httpd_register_uri_handler(http_server, &get_uri);
+    httpd_register_uri_handler(http_server, &post_uri);
+    ESP_LOGI(TAG, "HTTP server at 192.168.4.1");
+}
+
+static void stop_http_server(void) {
+    if (!http_server) return;
+    httpd_stop(http_server);
+    http_server = NULL;
+}
+
+static void wifi_event_handler(void*, esp_event_base_t base,
+                               int32_t id, void* data) {
+    if (base == WIFI_EVENT) {
+        if (id == WIFI_EVENT_AP_START) {
+            ESP_LOGI(TAG, "AP started: %s", WIFI_AP_SSID);
+            start_http_server();
+        } else if (id == WIFI_EVENT_STA_DISCONNECTED) {
+            ESP_LOGW(TAG, "WiFi disconnected");
+            nxt_set_txt("wifiStatus", "Disconnected");
+        }
+    } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t* ev = (ip_event_got_ip_t*)data;
+        char ip_str[20], ssid_str[33] = {};
+        snprintf(ip_str, sizeof(ip_str), "IP:" IPSTR, IP2STR(&ev->ip_info.ip));
+        wifi_ap_record_t ap;
+        if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK)
+            strlcpy(ssid_str, (char*)ap.ssid, sizeof(ssid_str));
+        ESP_LOGI(TAG, "WiFi connected: %s %s", ssid_str, ip_str);
+        nxt_set_txt("wifiStatus", "Connected");
+        nxt_set_txt("ssidVal",    ssid_str);
+        nxt_set_txt("ipAddr",     ip_str);
+        stop_http_server();
+    }
+}
+
+static void wifi_init(void) {
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    esp_netif_create_default_wifi_sta();
+    esp_netif_create_default_wifi_ap();
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(
+        WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event_handler, NULL, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(
+        IP_EVENT, IP_EVENT_STA_GOT_IP, wifi_event_handler, NULL, NULL));
+
+    // Попробовать auto-connect из NVS
+    char ssid[64] = {}, pass[64] = {};
+    bool has_creds = false;
+    nvs_handle_t nvs;
+    if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &nvs) == ESP_OK) {
+        size_t sl = sizeof(ssid), pl = sizeof(pass);
+        has_creds = (nvs_get_str(nvs, "ssid", ssid, &sl) == ESP_OK &&
+                     nvs_get_str(nvs, "pass", pass, &pl) == ESP_OK && sl > 1);
+        nvs_close(nvs);
+    }
+
+    if (has_creds) {
+        wifi_config_t sta_cfg = {};
+        strlcpy((char*)sta_cfg.sta.ssid,     ssid, sizeof(sta_cfg.sta.ssid));
+        strlcpy((char*)sta_cfg.sta.password, pass, sizeof(sta_cfg.sta.password));
+        ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+        ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta_cfg));
+        ESP_ERROR_CHECK(esp_wifi_start());
+        ESP_ERROR_CHECK(esp_wifi_connect());
+        ESP_LOGI(TAG, "Auto-connecting to '%s'", ssid);
+    } else {
+        ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_NULL));
+        ESP_ERROR_CHECK(esp_wifi_start());
+    }
+}
+
+// Запустить SoftAP для настройки WiFi
+static void start_wifi_config(void) {
+    ESP_LOGI(TAG, "Starting WiFi config AP");
+    nxt_set_txt("espStatus",  "Config...");
+    nxt_set_txt("wifiStatus", "Config...");
+
+    stop_http_server();
+    esp_wifi_stop();
+    vTaskDelay(pdMS_TO_TICKS(300));
+
+    wifi_config_t ap_cfg = {};
+    strlcpy((char*)ap_cfg.ap.ssid, WIFI_AP_SSID, sizeof(ap_cfg.ap.ssid));
+    ap_cfg.ap.ssid_len       = strlen(WIFI_AP_SSID);
+    ap_cfg.ap.authmode       = WIFI_AUTH_OPEN;
+    ap_cfg.ap.max_connection = 4;
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_cfg));
+    ESP_ERROR_CHECK(esp_wifi_start());
+    // start_http_server вызывается из WIFI_EVENT_AP_START
+}
+
+// Подключиться к WiFi (вызывается из main_task, безопасно)
+static void do_wifi_connect(const char* ssid, const char* pass) {
+    // Сохранить в NVS
+    nvs_handle_t nvs;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs) == ESP_OK) {
+        nvs_set_str(nvs, "ssid", ssid);
+        nvs_set_str(nvs, "pass", pass);
+        nvs_commit(nvs);
+        nvs_close(nvs);
+    }
+    ESP_LOGI(TAG, "Connecting to '%s'", ssid);
+    nxt_set_txt("espStatus",  "Connecting...");
+    nxt_set_txt("wifiStatus", "Connecting...");
+
+    stop_http_server();
+    esp_wifi_stop();
+    vTaskDelay(pdMS_TO_TICKS(300));
+
+    wifi_config_t sta_cfg = {};
+    strlcpy((char*)sta_cfg.sta.ssid,     ssid, sizeof(sta_cfg.sta.ssid));
+    strlcpy((char*)sta_cfg.sta.password, pass, sizeof(sta_cfg.sta.password));
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta_cfg));
+    ESP_ERROR_CHECK(esp_wifi_start());
+    ESP_ERROR_CHECK(esp_wifi_connect());
+}
+
+// ── Nextion: приём команд ─────────────────────────────────────
+static char nxt_rx_acc[256];
+static int  nxt_rx_acc_len = 0;
+
+static void nxt_handle_command(const char* cmd) {
+    ESP_LOGI(TAG, "NXT: '%s'", cmd);
+    if      (strcmp(cmd, "WIFI_CFG")     == 0) start_wifi_config();
+    else if (strcmp(cmd, "LOG_CLEAR")    == 0) clear_log();
+    else if (strcmp(cmd, "REFRESH_250")  == 0) refresh_ms = 250;
+    else if (strcmp(cmd, "REFRESH_500")  == 0) refresh_ms = 500;
+    else if (strcmp(cmd, "REFRESH_1000") == 0) refresh_ms = 1000;
+    else if (strcmp(cmd, "TOGGLE_CF")    == 0) unit_fahrenheit = !unit_fahrenheit;
+    else if (strcmp(cmd, "RESET_MINMAX") == 0) {
+        for (int i = 0; i < 5; i++) { t_min[i] = INFINITY; t_max[i] = -INFINITY; }
+    }
+    else if (strcmp(cmd, "HEATER_ON")  == 0) heater_status = 1;
+    else if (strcmp(cmd, "HEATER_OFF") == 0) heater_status = 0;
+}
+
+static void nxt_process_rx(void) {
+    uint8_t tmp[128];
+    int len = uart_read_bytes(NXT_UART, tmp, sizeof(tmp), pdMS_TO_TICKS(0));
+    for (int i = 0; i < len; i++) {
+        if (nxt_rx_acc_len < (int)sizeof(nxt_rx_acc) - 1)
+            nxt_rx_acc[nxt_rx_acc_len++] = (char)tmp[i];
+
+        if (nxt_rx_acc_len >= 3 &&
+            (uint8_t)nxt_rx_acc[nxt_rx_acc_len-3] == 0xFF &&
+            (uint8_t)nxt_rx_acc[nxt_rx_acc_len-2] == 0xFF &&
+            (uint8_t)nxt_rx_acc[nxt_rx_acc_len-1] == 0xFF) {
+
+            nxt_rx_acc[nxt_rx_acc_len - 3] = '\0';
+            const char* cmd = nxt_rx_acc;
+            while (*cmd != '\0' && (uint8_t)*cmd < 0x20) cmd++;
+            if (*cmd != '\0') nxt_handle_command(cmd);
+            nxt_rx_acc_len = 0;
         }
     }
 }
 
-static void draw_screen(const float temps[5]) {
-    if (canvas.getBuffer() == nullptr) return;
-    if (display_page == 0) draw_grid_page(temps);
-    else                   draw_stats_page(temps);
-    canvas.pushSprite(0, 0);
-}
-
-static void draw_splash(const char* msg) {
-    if (canvas.getBuffer() == nullptr) return;
-    canvas.fillScreen(TFT_BLACK);
-    canvas.setTextDatum(lgfx::middle_center);
-    canvas.setTextSize(1);
-    canvas.setTextColor(TFT_CYAN, TFT_BLACK);
-    canvas.drawString("TempMonitor v2", SCREEN_W / 2, SCREEN_H / 2 - 8);
-    canvas.setTextColor(TFT_DARKGREY, TFT_BLACK);
-    canvas.drawString(msg, SCREEN_W / 2, SCREEN_H / 2 + 8);
-    canvas.pushSprite(0, 0);
-}
-
-// ── Основная задача (5 Гц) ────────────────────────────────────
+// ── Основная задача ───────────────────────────────────────────
 static void main_task(void* /*arg*/) {
     float temps[5];
-    static char line[256];
+    static char json_line[256];
     TickType_t last_wake = xTaskGetTickCount();
 
     for (;;) {
         int64_t now_ms = esp_timer_get_time() / 1000LL;
 
-        // ── 1. Обработка кнопок ───────────────────────────────
-        uint8_t flags;
-        portENTER_CRITICAL(&btn_mux);
-        flags     = btn_flags;
-        btn_flags = 0;
-        portEXIT_CRITICAL(&btn_mux);
-
-        if (flags) {
-            if (display_sleeping) {
-                // Первое нажатие только будит — действие не выполняется
-                display_sleeping = false;
-                lcd.setBrightness(BL_LEVELS[bl_idx]);
-                last_btn_ms = now_ms;
-                flags = 0;
-            } else {
-                last_btn_ms = now_ms;
-            }
-        }
-
-        if (flags & (1u << 0)) {
-            display_page = (display_page + 1) % 2;
-            ESP_LOGI(TAG, "Page -> %d", display_page);
-        }
-        if (flags & (1u << 1)) {
-            unit_fahrenheit = !unit_fahrenheit;
-            ESP_LOGI(TAG, "Unit -> %s", unit_fahrenheit ? "F" : "C");
-        }
-        if (flags & (1u << 2)) {
-            bl_idx = (bl_idx + 1) % BL_NUM_STEPS;
-            lcd.setBrightness(BL_LEVELS[bl_idx]);
-            ESP_LOGI(TAG, "BL -> %d%%", BL_LEVELS[bl_idx] * 100 / 255);
-        }
-        if (flags & (1u << 3)) {
-            for (int i = 0; i < 5; i++) {
-                t_min[i] =  INFINITY;
-                t_max[i] = -INFINITY;
-            }
-            ESP_LOGI(TAG, "Min/Max reset");
-        }
-
-        // ── 2. Чтение + фильтрация датчиков ──────────────────
+        // 1. Датчики
         uint8_t err_mask = 0;
         for (int i = 0; i < 5; i++) {
-            float raw = max31855_parse(max31855_read_raw(CS_PINS[i]));
+            float raw = max31855_parse(max31855_read_raw(i));
             if (isnan(raw)) {
                 err_mask |= (uint8_t)(1 << i);
                 temps[i]  = NAN;
@@ -405,77 +541,69 @@ static void main_task(void* /*arg*/) {
             }
         }
 
-        // ── 3. Обновление дисплея ─────────────────────────────
-        if (!display_sleeping) {
-            draw_screen(temps);
-            if (now_ms - last_btn_ms >= SLEEP_TIMEOUT_MS) {
-                display_sleeping = true;
-                lcd.setBrightness(0);
-                ESP_LOGI(TAG, "Display sleep");
-            }
+        // 2. Nextion
+        nxt_process_rx();
+        nxt_send_sensors(temps);
+
+        // 3. Обработать отложенный запрос WiFi-подключения (из HTTP POST)
+        if (wifi_req.pending) {
+            wifi_req.pending = false;
+            do_wifi_connect(wifi_req.ssid, wifi_req.pass);
         }
 
-        // ── 4. Вывод JSON в Serial ────────────────────────────
+        // 4. rate для следующего цикла
+        for (int i = 0; i < 5; i++) t_prev[i] = temps[i];
+
+        // 5. JSON → UART0 (USB)
         int p = 0;
-        p += sprintf(line + p, "{\"timestamp\":%lld,\"top\":[", (long long)now_ms);
+        p += sprintf(json_line + p, "{\"timestamp\":%lld,\"top\":[", (long long)now_ms);
         for (int i = 0; i < 4; i++) {
-            if (i > 0) line[p++] = ',';
-            p = append_float(line, p, temps[i]);
+            if (i > 0) json_line[p++] = ',';
+            p = append_float(json_line, p, temps[i]);
         }
-        p += sprintf(line + p, "],\"bottom\":[");
-        p = append_float(line, p, temps[4]);
-        p += sprintf(line + p, "],\"status\":\"%s\"}\n",
+        p += sprintf(json_line + p, "],\"bottom\":[");
+        p = append_float(json_line, p, temps[4]);
+        p += sprintf(json_line + p, "],\"status\":\"%s\"}\n",
                      err_mask ? "SENSOR_ERR" : "OK");
-        fputs(line, stdout);
+        fputs(json_line, stdout);
         fflush(stdout);
 
         vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(200));
     }
 }
 
-// ── Точка входа ───────────────────────────────────────────────
+// ── app_main ──────────────────────────────────────────────────
 extern "C" void app_main(void) {
     vTaskDelay(pdMS_TO_TICKS(1500));
     ESP_LOGI(TAG, "=== TempMonitor v2 (ESP32-WROOM-32) ===");
 
+    esp_err_t nvs_err = nvs_flash_init();
+    if (nvs_err == ESP_ERR_NVS_NO_FREE_PAGES ||
+        nvs_err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        nvs_flash_erase();
+        nvs_flash_init();
+    }
+
     for (int i = 0; i < 5; i++) {
         t_min[i]    =  INFINITY;
         t_max[i]    = -INFINITY;
+        t_prev[i]   = NAN;
         ema_init[i] = false;
         buf_pos[i]  = 0;
     }
-    last_btn_ms = esp_timer_get_time() / 1000LL;
+    for (int i = 0; i < LOG_LINES; i++) log_entries[i][0] = '\0';
 
-    // Шаг 1: GPIO датчиков
-    spi_sens_init();
-    ESP_LOGI(TAG, "Sensor SPI OK");
+    spi_init();
+    ESP_LOGI(TAG, "Sensors SPI OK");
 
-    // Шаг 2: Дисплей
-    lcd.init();
-    lcd.setRotation(1);                     // landscape 160×128
-    lcd.setBrightness(BL_LEVELS[0]);
+    nxt_init();
+    ESP_LOGI(TAG, "Nextion UART2 OK");
 
-    canvas.setColorDepth(8);               // 8 bpp — 20 KB спрайт
-    if (canvas.createSprite(SCREEN_W, SCREEN_H) == nullptr) {
-        ESP_LOGE(TAG, "Sprite alloc FAILED — halting");
-        for (;;) vTaskDelay(pdMS_TO_TICKS(1000));
-    }
-    ESP_LOGI(TAG, "Display OK (%dx%d, 8bpp)", SCREEN_W, SCREEN_H);
+    wifi_init();
+    ESP_LOGI(TAG, "WiFi init OK");
 
-    draw_splash("Initialising...");
+    nxt_send_system_info();
 
-    // Шаг 3: Кнопки
-    buttons_init();
-    ESP_LOGI(TAG, "Buttons OK (GPIO %d/%d/%d/%d)",
-             BTN0_PIN, BTN1_PIN, BTN2_PIN, BTN3_PIN);
-
-    // Шаг 4: Первый кадр
-    float init_temps[5];
-    for (int i = 0; i < 5; i++)
-        init_temps[i] = max31855_parse(max31855_read_raw(CS_PINS[i]));
-    draw_screen(init_temps);
-
-    // Шаг 5: Основная задача
-    ESP_LOGI(TAG, "Starting main task @ 5 Hz");
     xTaskCreate(main_task, "main_task", 8192, nullptr, 5, nullptr);
+    ESP_LOGI(TAG, "Main task @ 5 Hz");
 }

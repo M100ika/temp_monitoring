@@ -23,7 +23,16 @@
       "Bash(python create_icon.py)",
       "Bash(python -c 'from PIL import Image; img=Image.open\\('\\\\''icon.ico'\\\\''\\); print\\('\\\\''Sizes:'\\\\'', img.info.get\\('\\\\''sizes'\\\\'', '\\\\''n/a'\\\\''\\)\\); sizes=[]; img.seek\\(0\\) *)",
       "Bash(python -c ' *)",
-      "Bash(python *)"
+      "Bash(python *)",
+      "Bash(python3 -c \"import serial.tools.list_ports; [print\\(p.device, p.description\\) for p in serial.tools.list_ports.comports\\(\\)]\")",
+      "Bash(lsusb)",
+      "Bash(timeout 15 pio device monitor -e monitor --no-reconnect)",
+      "Bash(stty -F /dev/ttyACM0 115200 raw -echo)",
+      "Bash(timeout 12 cat /dev/ttyACM0)",
+      "Bash(timeout 10 cat /dev/ttyACM0)",
+      "Bash(timeout 8 cat /dev/ttyACM0)",
+      "Bash(pio device *)",
+      "Bash(timeout 10 python3 *)"
     ]
   }
 }

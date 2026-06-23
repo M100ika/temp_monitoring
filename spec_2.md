@@ -38,11 +38,11 @@
 |--------------|-----------|--------------------------------|
 | SCK (общий)  | **GPIO18** | CLK всех 5 датчиков (VSPI CLK)|
 | MISO (общий) | **GPIO19** | DO всех 5 датчиков (VSPI MISO)|
-| CS — T1      | **GPIO25** | Chip Select, MAX31855 #1       |
-| CS — T2      | **GPIO26** | Chip Select, MAX31855 #2       |
-| CS — T3      | **GPIO27** | Chip Select, MAX31855 #3       |
-| CS — T4      | **GPIO32** | Chip Select, MAX31855 #4       |
-| CS — T5      | **GPIO33** | Chip Select, MAX31855 #5       |
+| CS — T1      | **GPIO32** | Chip Select, MAX31855 #1       |
+| CS — T2      | **GPIO33** | Chip Select, MAX31855 #2       |
+| CS — T3      | **GPIO25** | Chip Select, MAX31855 #3       |
+| CS — T4      | **GPIO26** | Chip Select, MAX31855 #4       |
+| CS — T5      | **GPIO27** | Chip Select, MAX31855 #5       |
 
 Каждый MAX31855: VCC → 3.3 В, GND → GND, DO → GPIO19, CLK → GPIO18, CS → свой пин.
 
@@ -72,13 +72,13 @@
 | 17   | Output      | UART2 TX → Nextion RX    |
 | 18   | Output      | SPI SCK → все датчики    |
 | 19   | Input       | SPI MISO ← все датчики   |
-| 25   | Output      | Sensor CS T1             |
-| 26   | Output      | Sensor CS T2             |
-| 27   | Output      | Sensor CS T3             |
-| 32   | Output      | Sensor CS T4             |
-| 33   | Output      | Sensor CS T5             |
-| 1    | —           | TX0 (USB Serial debug)   |
-| 3    | —           | RX0 (USB Serial debug)   |
+| 32   | Output      | Sensor CS T1             |
+| 33   | Output      | Sensor CS T2             |
+| 25   | Output      | Sensor CS T3             |
+| 26   | Output      | Sensor CS T4             |
+| 27   | Output      | Sensor CS T5             |
+| 17   | —           | TX2 (USB Serial debug)   |
+| 16   | —           | RX2 (USB Serial debug)   |
 | 0    | —           | BOOT кнопка (не трогать) |
 | 2    | —           | Встроенный LED           |
 | 6–11 | —           | Flash (не использовать!) |
