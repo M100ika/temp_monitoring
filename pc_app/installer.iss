@@ -1,5 +1,5 @@
 #define MyAppName      "TempMonitor"
-#define MyAppVersion   "1.0"
+#define MyAppVersion   "1.1"
 #define MyAppPublisher "NU Lab"
 #define MyAppExeName   "TempMonitor.exe"
 
