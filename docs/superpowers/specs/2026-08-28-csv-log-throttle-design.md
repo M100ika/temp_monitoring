@@ -30,6 +30,13 @@ A `QComboBox` labeled "Запись:" is added to the toolbar, next to the
 | 2 с            | 2         |
 | 5 с            | 5         |
 | 10 с           | 10        |
+| 15 с           | 15        |
+| 30 с           | 30        |
+| 60 с           | 60        |
+| 90 с           | 90        |
+| 120 с          | 120       |
+| 300 с          | 300       |
+| 600 с          | 600       |
 
 Default selection on app start: `1 с`.
 
