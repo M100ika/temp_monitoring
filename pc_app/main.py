@@ -39,6 +39,16 @@ COLORS = [
     (200, 80,  255),  # T5 – purple
 ]
 
+# CSV log write interval: (label shown in the combo box, seconds between
+# writes). 0 seconds means "write every received packet".
+LOG_INTERVALS = [
+    ("Каждый пакет", 0),
+    ("1 с", 1),
+    ("2 с", 2),
+    ("5 с", 5),
+    ("10 с", 10),
+]
+
 
 # ─────────────────────────────────────────────────────────────
 # Serial reader thread – emits parsed packets via Qt signal
@@ -83,6 +93,17 @@ class SerialReader(threading.Thread):
         self._stop.set()
 
 
+def _should_write_csv_row(interval_s: float, last_write: float | None, rx: float) -> bool:
+    """Whether a packet received at time `rx` should be written to the CSV
+    log, given the configured `interval_s` and the timestamp of the last
+    row actually written (`last_write`, None if none written yet)."""
+    if interval_s == 0:
+        return True
+    if last_write is None:
+        return True
+    return (rx - last_write) >= interval_s
+
+
 # ─────────────────────────────────────────────────────────────
 # Main Window
 # ─────────────────────────────────────────────────────────────
@@ -103,6 +124,8 @@ class MainWindow(QMainWindow):
         self._csv_writer = None
         self._logging   = False
         self._pkt_count = 0
+        self._log_interval_s : float = 0
+        self._last_csv_write : float | None = None
 
         self._build_ui()
         self._refresh_ports()
@@ -134,6 +157,13 @@ class MainWindow(QMainWindow):
         toolbar.addWidget(self._btn_connect)
 
         toolbar.addSpacing(20)
+
+        toolbar.addWidget(QLabel("Запись:"))
+        self._combo_log_interval = QComboBox()
+        for label, seconds in LOG_INTERVALS:
+            self._combo_log_interval.addItem(label, seconds)
+        self._combo_log_interval.setCurrentIndex(1)  # default: "1 с"
+        toolbar.addWidget(self._combo_log_interval)
 
         self._btn_log = QPushButton("Start Logging")
         self._btn_log.setEnabled(False)
@@ -306,16 +336,18 @@ class MainWindow(QMainWindow):
                     item.setForeground(QColor("tomato"))
             self._table.setItem(0, col, item)
 
-        # CSV logging
+        # CSV logging (throttled by the operator-selected interval)
         if self._logging and self._csv_writer:
-            ts_str = datetime.fromtimestamp(rx).isoformat(timespec="milliseconds")
-            def _cv(v): return "" if v is None else v
-            self._csv_writer.writerow([
-                ts_str,
-                _cv(top[0]), _cv(top[1]), _cv(top[2]), _cv(top[3]),
-                _cv(bottom[0]),
-                status,
-            ])
+            if _should_write_csv_row(self._log_interval_s, self._last_csv_write, rx):
+                ts_str = datetime.fromtimestamp(rx).isoformat(timespec="milliseconds")
+                def _cv(v): return "" if v is None else v
+                self._csv_writer.writerow([
+                    ts_str,
+                    _cv(top[0]), _cv(top[1]), _cv(top[2]), _cv(top[3]),
+                    _cv(bottom[0]),
+                    status,
+                ])
+                self._last_csv_write = rx
 
         self._pkt_count += 1
 
@@ -350,6 +382,9 @@ class MainWindow(QMainWindow):
         self._csv_writer = csv.writer(self._csv_file)
         self._csv_writer.writerow(
             ["Timestamp", "T1", "T2", "T3", "T4", "T5", "Status"])
+        self._log_interval_s = self._combo_log_interval.currentData()
+        self._last_csv_write = None
+        self._combo_log_interval.setEnabled(False)
         self._logging = True
         self._btn_log.setText("Stop Logging")
         self.statusBar().showMessage(f"Logging to {path}")
@@ -360,6 +395,7 @@ class MainWindow(QMainWindow):
             self._csv_file.close()
             self._csv_file   = None
             self._csv_writer = None
+        self._combo_log_interval.setEnabled(True)
         self._btn_log.setText("Start Logging")
         self._btn_log.setChecked(False)
         self.statusBar().showMessage("Logging stopped", 3000)
